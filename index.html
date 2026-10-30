@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>18-DOF Hexapod Physics Simulator</title>
+<style>
+:root{color-scheme:dark;--p:rgba(15,23,42,.88);--b:#334155;--f:#e2e8f0;--m:#94a3b8;--a:#f59e0b;--g:#10b981;--r:#f43f5e}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#070b12;color:var(--f);font:12px/1.5 system-ui,sans-serif;overflow:hidden;user-select:none}
+canvas{display:block}
+.pn{position:absolute;background:var(--p);border:1px solid var(--b);border-radius:12px;padding:12px;backdrop-filter:blur(8px)}
+#hud{top:calc(12px + env(safe-area-inset-top,0px));left:12px;width:250px;font-family:ui-monospace,monospace;pointer-events:none}
+#ctl{top:calc(12px + env(safe-area-inset-top,0px));right:12px;width:270px;max-height:calc(100% - 24px);overflow:auto}
+h1{font-size:13px;margin:0 0 8px;color:var(--a);letter-spacing:.06em;text-transform:uppercase}
+.row{display:flex;justify-content:space-between;gap:8px}.row span:first-child{color:var(--m)}.row span:last-child{color:#7dd3fc;text-align:right}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:8px 0}
+button{background:#1e293b;color:var(--f);border:1px solid var(--b);border-radius:8px;padding:8px 4px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--a)}button.on{background:#d97706;border-color:#fbbf24}
+.wide{grid-column:span 3}.two{grid-column:span 2}
+label{display:block;margin-top:8px;color:var(--m)}label b{float:right;color:var(--a);font-weight:600}
+input[type=range]{width:100%;accent-color:var(--a)}
+#dots{display:flex;gap:4px;margin-top:8px}
+.d{flex:1;text-align:center;padding:2px 0;border-radius:4px;background:var(--r);color:#000;font-size:10px;font-weight:700}.d.g{background:var(--g)}
+@media(max-width:700px){#hud{width:190px;font-size:10px}#ctl{width:210px}#pip{width:200px!important;height:125px!important}}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+<div id="hud" class="pn"><h1>18-DOF Hexapod</h1><div id="tl"></div><div id="dots"></div></div>
+<div id="pip" style="position:absolute;left:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));width:288px;height:180px;border:2px solid #f59e0b;border-radius:8px;pointer-events:none"><span style="position:absolute;top:4px;left:8px;font:700 10px ui-monospace,monospace;color:#f59e0b;text-shadow:0 0 4px #000">ROBOT CAM <span id="pipt"></span></span></div>
+<div id="ctl" class="pn">
+<h1>Controller</h1>
+<div class="grid">
+<button data-c="turnL">↺ Turn L</button><button data-c="forward">▲ Forward</button><button data-c="turnR">Turn R ↻</button>
+<button data-c="crabL">◄ Crab L</button><button data-c="stop">■ Stop</button><button data-c="crabR">Crab R ►</button>
+<span></span><button data-c="backward">▼ Back</button><span></span>
+<button class="wide" id="bm">Quadruped Stance + Pincers (M)</button>
+<button id="bp">Pause</button><button class="two" id="br">Reset</button>
+</div>
+<label>Gait Speed <b id="ls">1.0x</b></label><input type="range" id="rs" min="0.4" max="2" step="0.1" value="1">
+<label>Foot Lift <b id="ll">35 mm</b></label><input type="range" id="rl" min="15" max="50" step="1" value="35">
+<label>Chassis Height <b id="lh">95 mm</b></label><input type="range" id="rh" min="70" max="120" step="1" value="95">
+<h1 style="margin-top:14px">Camera Servo</h1>
+<label>Pan <b id="lp">0°</b></label><input type="range" id="rp" min="-170" max="170" step="1" value="0">
+<label>Tilt <b id="lt">0°</b></label><input type="range" id="rt" min="-30" max="45" step="1" value="0">
+<div class="grid"><button id="bcc">Center</button><button id="bcs">Auto Scan</button><button id="bcv" class="on">Cam View</button></div>
+<div style="color:var(--m)">Keys: Z / X pan, C center</div>
+</div>
+<script>
+const T=THREE,C=CANNON;
+const COXA=3,L1=8.75,L2=10.7,R0=15,MU=0.9,DT=1/360,MASS=2.4,G=981,KV=2400,KH=1200,CV=30,CH=10,STRIDE=4,FREQ=1.0,RREF=27,SHIFT=5,INERTIA=[350,450,350];
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v)),sm=t=>{t=clamp(t,0,1);return t*t*(3-2*t)},lerp=(a,b,t)=>a+(b-a)*t;
+const P={speed:1,lift:3.5,height:9.5};
+const CMDS={forward:[0,-1,0],backward:[0,1,0],crabR:[1,0,0],crabL:[-1,0,0],turnL:[0,0,1],turnR:[0,0,-1],stop:[0,0,0]};
+const S={cmd:'crabR',mode:'walk',paused:false};
+
+const scene=new T.Scene();scene.background=new T.Color(0x070b12);scene.fog=new T.FogExp2(0x070b12,0.0016);
+const camera=new T.PerspectiveCamera(45,innerWidth/innerHeight,0.5,6000);camera.position.set(75,55,95);
+const renderer=new T.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=T.PCFSoftShadowMap;document.body.prepend(renderer.domElement);
+const controls=new T.OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true;controls.maxPolarAngle=Math.PI/2-.03;controls.minDistance=25;controls.maxDistance=400;
+scene.add(new T.HemisphereLight(0xbfd8ff,0x1e293b,.7));
+const sun=new T.DirectionalLight(0xffffff,1.1);sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);sun.shadow.bias=-.0004;
+Object.assign(sun.shadow.camera,{left:-60,right:60,top:60,bottom:-60,near:1,far:400});sun.shadow.camera.updateProjectionMatrix();scene.add(sun,sun.target);
+const fill=new T.DirectionalLight(0x38bdf8,.35);fill.position.set(-80,60,-70);scene.add(fill);
+
+function gridTex(){
+const c=document.createElement('canvas');c.width=c.height=1024;const x=c.getContext('2d');
+x.fillStyle='#0f172a';x.fillRect(0,0,1024,1024);x.fillStyle='#132038';
+for(let i=0;i<10;i++)for(let j=0;j<10;j++)if((i+j)&1)x.fillRect(i*102.4,j*102.4,102.4,102.4);
+x.strokeStyle='#243247';x.lineWidth=2;x.beginPath();
+for(let i=0;i<=10;i++){x.moveTo(i*102.4,0);x.lineTo(i*102.4,1024);x.moveTo(0,i*102.4);x.lineTo(1024,i*102.4)}x.stroke();
+x.strokeStyle='#475569';x.lineWidth=4;x.beginPath();x.moveTo(512,0);x.lineTo(512,1024);x.moveTo(0,512);x.lineTo(1024,512);x.stroke();
+x.strokeStyle='#38bdf8';x.lineWidth=10;x.strokeRect(0,0,1024,1024);
+const t=new T.CanvasTexture(c);t.wrapS=t.wrapT=T.RepeatWrapping;t.repeat.set(40,40);t.anisotropy=8;return t}
+const floor=new T.Mesh(new T.PlaneGeometry(4000,4000),new T.MeshStandardMaterial({map:gridTex(),roughness:.8,metalness:.1}));
+floor.rotation.x=-Math.PI/2;floor.receiveShadow=true;scene.add(floor);
+const lc={};
+function ltex(t){if(!lc[t]){const c=document.createElement('canvas');c.width=256;c.height=64;const x=c.getContext('2d');x.fillStyle='#f59e0b';x.font='bold 34px monospace';x.textAlign='center';x.fillText(t,128,44);lc[t]=new T.CanvasTexture(c)}return lc[t]}
+const lbl=[];for(let i=0;i<49;i++){const s=new T.Sprite(new T.SpriteMaterial({transparent:true,depthWrite:false}));s.scale.set(32,8,1);scene.add(s);lbl.push(s)}
+let lk='';
+function labels(cx,cz){
+const gx=Math.round(cx/100),gz=Math.round(cz/100),k=gx+','+gz;if(k===lk)return;lk=k;let i=0;
+for(let a=-3;a<=3;a++)for(let b=-3;b<=3;b++){const s=lbl[i++];s.position.set((gx+a)*100,.5,(gz+b)*100);s.material.map=ltex(`${gx+a}, ${gz+b} m`);s.material.needsUpdate=true}}
+
+const world=new C.World();world.gravity.set(0,-G,0);
+const gnd=new C.Body({mass:0,shape:new C.Plane(),collisionFilterGroup:1,collisionFilterMask:6});
+gnd.quaternion.setFromAxisAngle(new C.Vec3(1,0,0),-Math.PI/2);world.addBody(gnd);
+const body=new C.Body({mass:MASS,shape:new C.Box(new C.Vec3(12,3.6,10.4)),linearDamping:.05,angularDamping:.4,collisionFilterGroup:2,collisionFilterMask:1});world.addBody(body);
+body.inertia.set(INERTIA[0],INERTIA[1],INERTIA[2]);body.invInertia.set(1/INERTIA[0],1/INERTIA[1],1/INERTIA[2]);body.updateInertiaWorld(true);
+const ballBody=new C.Body({mass:.05,shape:new C.Sphere(1.2),collisionFilterGroup:4,collisionFilterMask:1,linearDamping:.1});world.addBody(ballBody);
+
+const M=(c,o={})=>new T.MeshStandardMaterial(Object.assign({color:c,roughness:.45,metalness:.25},o));
+const mCar=M(0xf97316,{roughness:.55}),mDark=M(0x1e293b,{roughness:.6}),mServo=M(0x0f172a,{metalness:.5}),mHorn=M(0xf8fafc,{metalness:.9,roughness:.2}),mGold=M(0xf59e0b,{metalness:.7}),mClaw=M(0xf97316);
+const mk=(g,m,x=0,y=0,z=0)=>{const o=new T.Mesh(g,m);o.position.set(x,y,z);o.castShadow=true;o.receiveShadow=true;return o};
+const robot=new T.Group();scene.add(robot);
+const hex=()=>new T.CylinderGeometry(1,1,.5,48).scale(11,1,7.5);
+function carTex(){const c=document.createElement('canvas');c.width=c.height=512;const x=c.getContext('2d');
+const g=x.createRadialGradient(256,256,20,256,256,300);g.addColorStop(0,'#d13a2a');g.addColorStop(1,'#7f1d1d');x.fillStyle=g;x.fillRect(0,0,512,512);
+for(let i=0;i<900;i++){x.fillStyle=Math.random()<.5?'rgba(255,170,120,.10)':'rgba(40,0,0,.14)';x.beginPath();x.arc(Math.random()*512,Math.random()*512,Math.random()*9+1,0,7);x.fill()}
+const t=new T.CanvasTexture(c);t.wrapS=t.wrapT=T.RepeatWrapping;return t}
+const shellStart=robot.children.length;const plateB=mk(hex(),mDark,0,-1.4,0);robot.add(plateB,mk(new T.SphereGeometry(1,48,24,0,Math.PI*2,0,Math.PI/2).scale(11,3.4,7.5),mCar,0,1.2,0));
+for(let k=0;k<5;k++)[1,-1].forEach(s=>{const t=.5+k*.18,sp=mk(new T.ConeGeometry(.45,1.5,8),mCar,s*10.6*Math.cos(t),1.3,-7.3*Math.sin(t));sp.rotation.z=-s*1.2;sp.rotation.x=-Math.sin(t)*.9;robot.add(sp)});
+[[6,4],[-6,4],[8,0],[-8,0],[5,-5],[-5,-5]].forEach(([x,z])=>robot.add(mk(new T.CylinderGeometry(.35,.35,2.8,10),mHorn,x,0,z)));
+robot.add(mk(new T.BoxGeometry(6,1.8,8),mServo,0,0,0));
+[-3,3].forEach(x=>{robot.add(mk(new T.CylinderGeometry(.4,.5,2.2,10),mCar,x,2.6,-6.6));robot.add(mk(new T.SphereGeometry(.8,12,12),mServo,x,3.9,-6.9))});
+const claws=[];
+[1,-1].forEach(s=>{
+const sh=new T.Group();sh.position.set(s*6.5,.9,-5.6);sh.rotation.y=-s*.45;robot.add(sh);
+const cyl=(r1,r2,l)=>new T.CylinderGeometry(r1,r2,l,12).rotateX(Math.PI/2).translate(0,0,-l/2);
+sh.add(mk(cyl(.9,.8,4),mCar));
+const el=new T.Group();el.position.z=-4;el.rotation.y=s*1.0;sh.add(el);
+el.add(mk(new T.SphereGeometry(.9,12,12),mGold),mk(cyl(.8,.9,3.5),mCar));
+const wr=new T.Group();wr.position.z=-3.5;wr.rotation.y=s*.3;el.add(wr);
+wr.add(mk(new T.SphereGeometry(1,20,14).scale(1.5,1.2,2.3),mCar,0,0,-2));
+wr.add(mk(new T.ConeGeometry(.55,3.4,10).rotateX(-Math.PI/2).translate(0,0,-1.7),mClaw,s*.55,0,-3.6));
+const fm=new T.Group();fm.position.set(-s*.55,0,-3.6);wr.add(fm);
+fm.add(mk(new T.ConeGeometry(.5,3,10).rotateX(-Math.PI/2).translate(0,0,-1.5),mClaw));
+claws.push({fm,s})});
+robot.children.slice(shellStart).forEach(c=>robot.remove(c));
+{const hexG=(r,t)=>new T.CylinderGeometry(r,r,t,6).rotateY(Math.PI/6),frame=M(0x27272a,{roughness:.6});
+[-3.6,3.6].forEach((y,i)=>robot.add(mk(hexG(13,.5),i?mCar:frame,0,y,0)));
+for(let k=0;k<6;k++){const a=(k*60+30)*Math.PI/180;robot.add(mk(new T.CylinderGeometry(.5,.5,7.2,10),mHorn,9.5*Math.cos(a),0,9.5*Math.sin(a)))}
+[[-1,-3.5],[1,-3.5],[-1,3.5],[1,3.5]].forEach(([x,z])=>robot.add(mk(new T.CylinderGeometry(.9,.9,6.55,16).rotateX(Math.PI/2),M(0x1d4ed8),x,-1.7,z)));
+robot.add(mk(new T.BoxGeometry(10,.3,8),M(0x166534),0,1.5,0),mk(new T.ConeGeometry(1.5,3,4).rotateX(-Math.PI/2),mClaw,0,3.6,-13.5))}
+const camPanG=new T.Group(),camTiltG=new T.Group(),rcam=new T.PerspectiveCamera(65,1.6,.3,3000);
+{robot.add(mk(new T.BoxGeometry(3,.4,3),mDark,0,3.95,2),mk(new T.BoxGeometry(2.3,2.4,1.3),mServo,0,5.2,2),mk(new T.CylinderGeometry(.7,.7,.3,16),mHorn,0,6.55,2));
+camPanG.position.set(0,6.7,2);robot.add(camPanG);
+camPanG.add(mk(new T.BoxGeometry(.4,2.2,1.4),mDark,-1.6,1.1,0),mk(new T.BoxGeometry(.4,2.2,1.4),mDark,1.6,1.1,0),mk(new T.BoxGeometry(1,1.2,1.6),mServo,2.2,1.1,0));
+camTiltG.position.set(0,1.2,0);camPanG.add(camTiltG);
+camTiltG.add(mk(new T.BoxGeometry(2.8,1.9,2.4),mServo),mk(new T.CylinderGeometry(.7,.8,.9,20).rotateX(Math.PI/2),M(0x0b1220,{emissive:0x1d4ed8,emissiveIntensity:.5,metalness:.8}),0,0,-1.6),mk(new T.SphereGeometry(.15,8,8),new T.MeshBasicMaterial({color:0xff2d2d}),1.1,.6,-1.25));
+rcam.position.set(0,0,-2.1);camTiltG.add(rcam)}
+
+const LEG_DEF=[[6,-10.39,60],[12,0,0],[6,10.39,-60],[-6,10.39,-120],[-12,0,180],[-6,-10.39,120]];
+const femGeo=new T.BoxGeometry(L1,2,.6).translate(L1/2,0,0),tibGeo=new T.CylinderGeometry(.9,.3,L2,12).rotateZ(Math.PI/2).translate(L2/2,0,0);
+const jawGeo=new T.ConeGeometry(.45,2.6,8).rotateZ(-Math.PI/2).translate(1.3,0,0);
+const horn=()=>{const h=mk(new T.CylinderGeometry(.8,.8,.4,16),mHorn);h.rotation.x=Math.PI/2;return h};
+const legs=LEG_DEF.map(([mx,mz,deg],i)=>{
+const a=deg*Math.PI/180,dx=Math.cos(a),dz=-Math.sin(a);
+const hip=new T.Group();hip.position.set(mx,0,mz);hip.rotation.y=a;robot.add(hip);
+hip.add(mk(new T.BoxGeometry(1.8,1.9,1.8),mServo,.4,0,0));
+const cox=new T.Group();hip.add(cox);cox.add(mk(new T.BoxGeometry(COXA,1.6,1.8),mCar,COXA/2,0,0));
+const fem=new T.Group();fem.position.x=COXA;cox.add(fem);fem.add(mk(new T.BoxGeometry(1.8,2.2,1.6),mServo,0,0,0),horn(),mk(femGeo,mCar));
+const tib=new T.Group();tib.position.x=L1;fem.add(tib);tib.add(mk(new T.SphereGeometry(.8,12,12),mGold),horn(),mk(tibGeo,mCar));
+const mat=new T.MeshStandardMaterial({color:0x10b981,emissive:0x064e3b,roughness:.4});
+tib.add(mk(new T.SphereGeometry(.9,16,16),mat,L2,0,0));
+const front=i===0||i===5,jaws=[];
+if(front)[1,-1].forEach(s=>{const g=new T.Group();g.position.set(L2,0,0);g.add(mk(jawGeo,mClaw));tib.add(g);jaws.push(g)});
+return{i,mx,mz,a,n:[mx+R0*dx,mz+R0*dz],front,cox,fem,tib,mat,jaws,g:true,anchor:new T.Vector3(),p:new T.Vector3(),fb:new T.Vector3(),fw:new T.Vector3()}});
+
+const polyGeo=new T.BufferGeometry().setAttribute('position',new T.BufferAttribute(new Float32Array(21),3));
+const poly=new T.Line(polyGeo,new T.LineBasicMaterial({color:0x10b981}));poly.frustumCulled=false;scene.add(poly);
+const com=new T.Mesh(new T.SphereGeometry(.5,12,12),new T.MeshBasicMaterial({color:0xfacc15}));scene.add(com);
+const ballMesh=mk(new T.SphereGeometry(1.2,24,24),M(0x38bdf8,{emissive:0x0c4a6e}));ballMesh.visible=false;scene.add(ballMesh);
+const pole=mk(new T.CylinderGeometry(.25,.25,1,10),mDark);pole.visible=false;scene.add(pole);
+
+const bp=new T.Vector3(),bq=new T.Quaternion(),bqi=new T.Quaternion(),rel=new T.Vector3(),pw=new T.Vector3(),vp=new T.Vector3(),vel=new T.Vector3(),av=new T.Vector3(),tip=new T.Vector3(),tmid=new T.Vector3(),home=new T.Vector3();
+const cur={x:0,z:0,w:0};
+let phase=0,idle=true,sh=0,rs=0,mt=0,ballMode=0,odom=0,jaw=.3,grounded=6,lastX=0,lastZ=0;
+
+function reset(){
+body.position.set(0,P.height,0);body.velocity.set(0,0,0);body.angularVelocity.set(0,0,0);body.quaternion.set(0,0,0,1);
+bp.set(0,P.height,0);bq.set(0,0,0,1);
+for(const L of legs){L.anchor.set(L.n[0],0,L.n[1]);L.g=true}
+phase=0;idle=true;sh=rs=mt=0;ballMode=0;odom=0;cur.x=cur.z=cur.w=0;lastX=lastZ=0}
+
+function substep(){
+bp.copy(body.position);bq.copy(body.quaternion);bqi.copy(bq).invert();vel.copy(body.velocity);av.copy(body.angularVelocity);
+const man=S.mode==='manip',cm=man?CMDS.stop:CMDS[S.cmd],k=Math.min(1,DT*4);
+cur.x+=(cm[0]-cur.x)*k;cur.z+=(cm[1]-cur.z)*k;cur.w+=(cm[2]-cur.w)*k;
+const want=cm[0]||cm[1]||cm[2],amp=Math.min(1,Math.hypot(cur.x,cur.z,cur.w)),adv=DT*FREQ*P.speed;
+if(want||amp>.03){phase+=adv;idle=false}
+else if(!idle){const nb=Math.ceil(phase*2-1e-9)/2;phase=Math.min(phase+adv,nb);if(phase>=nb-1e-9)idle=true}
+sh=clamp(sh+(man?1:-1)*DT/1.5,0,1);rs=clamp(rs+(man&&sh>=1?1:-1)*DT/1.2,0,1);
+const SH=sm(sh),RS=sm(rs);mt=man&&rs>=1?mt+DT:0;
+const hh=P.height-(idle?0:.3*amp*Math.abs(Math.cos(2*Math.PI*phase))),sway=idle?0:.4*amp*Math.sin(2*Math.PI*phase);
+const cl=sm((mt-.6)/1.2),gh=lerp(2.4,1.25,cl),lift=1.5*sm((mt-2.2)/1.5);
+jaw=.3+(lerp(.7,.12,cl)-.3)*RS;
+tmid.set(0,-hh+9+lift,-26).applyQuaternion(bq).add(bp);
+if(!man&&ballMode>0&&ballMode<3)ballMode=3;
+if(man&&rs>.5&&(ballMode===0||ballMode===3)){home.copy(tmid);ballMode=1}
+if(ballMode===1&&mt>1.9)ballMode=2;
+grounded=0;
+for(const L of legs){
+const f=(phase+(L.i&1)*.5)%1;let sw=false,u=.5;
+if(!idle){sw=f<.5;u=sw?f*2:(f-.5)*2}
+let dx=STRIDE*(cur.x+cur.w*L.n[1]/RREF),dz=STRIDE*(cur.z-cur.w*L.n[0]/RREF);
+const dl=Math.hypot(dx,dz);if(dl>4.5){dx*=4.5/dl;dz*=4.5/dl}
+const kk=sw?2*sm(u)-1:1-2*u;
+L.p.set(L.n[0]+dx*kk-sway,-hh+(sw?P.lift*Math.sin(Math.PI*u):0),L.n[1]+dz*kk-SHIFT*SH);
+if(L.front&&RS>0){tip.set((L.i?-1:1)*gh,-hh+9+lift,-26);L.p.lerp(tip,RS);sw=true}
+if(L.g&&sw)L.g=false;
+else if(!L.g&&!sw){L.anchor.copy(L.p).applyQuaternion(bq).add(bp);L.anchor.y=0;L.g=true}
+if(L.g){
+grounded++;
+rel.copy(L.anchor).sub(bp);pw.copy(L.p).applyQuaternion(bq);
+vp.set(vel.x+av.y*rel.z-av.z*rel.y,vel.y+av.z*rel.x-av.x*rel.z,vel.z+av.x*rel.y-av.y*rel.x);
+let fx=KH*(rel.x-pw.x)-CH*vp.x,fz=KH*(rel.z-pw.z)-CH*vp.z;
+const fy=clamp(KV*(rel.y-pw.y)-CV*vp.y,0,4*MASS*G),fh=Math.hypot(fx,fz),lim=MU*fy;
+if(fh>lim){const s=lim/fh;L.anchor.x-=fx*(1-s)/KH;L.anchor.z-=fz*(1-s)/KH;fx*=s;fz*=s}
+body.force.x+=fx;body.force.y+=fy;body.force.z+=fz;
+body.torque.x+=rel.y*fz-rel.z*fy;body.torque.y+=rel.z*fx-rel.x*fz;body.torque.z+=rel.x*fy-rel.y*fx;
+L.fb.copy(rel).applyQuaternion(bqi);L.fw.copy(L.anchor)
+}else{L.fb.copy(L.p);L.fw.copy(L.p).applyQuaternion(bq).add(bp)}
+}
+if(ballMode===0)ballBody.position.set(0,-500,0);
+else if(ballMode===1)ballBody.position.set(home.x,home.y,home.z);
+else if(ballMode===2)ballBody.position.set(tmid.x,tmid.y,tmid.z);
+if(ballMode<3)ballBody.velocity.set(0,0,0);
+world.step(DT);
+}
+
+function ik(L){
+const f=L.fb,dx=f.x-L.mx,dz=f.z-L.mz,c=Math.cos(L.a),s=Math.sin(L.a);
+const lx=dx*c-dz*s,lz=dx*s+dz*c,y=f.y,d=Math.hypot(lx,lz)-COXA;
+const D=clamp(Math.hypot(d,y),Math.abs(L1-L2)+.05,L1+L2-.05);
+L.cox.rotation.y=Math.atan2(-lz,lx);
+L.fem.rotation.z=Math.atan2(y,d)+Math.acos(clamp((L1*L1+D*D-L2*L2)/(2*L1*D),-1,1));
+L.tib.rotation.z=Math.acos(clamp((L1*L1+L2*L2-D*D)/(2*L1*L2),-1,1))-Math.PI}
+
+const tl=document.getElementById('tl'),dots=document.getElementById('dots');
+dots.innerHTML=['RF','RM','RR','LR','LM','LF'].map(n=>`<span class="d">${n}</span>`).join('');
+const dEls=[...dots.children];
+const row=(a,b)=>`<div class="row"><span>${a}</span><span>${b}</span></div>`;
+function status(){
+if(S.mode==='manip')return sh<1?'SHIFTING MASS REARWARD':rs<1?'RAISING PINCERS':ballMode<2?'OPEN / CLOSING':mt<3.7?'LIFTING TARGET':'HOLDING TARGET';
+return S.cmd.toUpperCase()+(idle?' (IDLE)':'')}
+let fc=0;
+function hud(){
+const f=new T.Vector3(0,0,-1).applyQuaternion(bq),hd=((Math.atan2(-f.x,-f.z)*180/Math.PI)%360+360)%360;
+tl.innerHTML=row('State',status())+row('World X',body.position.x.toFixed(1)+' cm')+row('World Y',body.position.y.toFixed(1)+' cm')+row('World Z',body.position.z.toFixed(1)+' cm')
++row('Speed',Math.hypot(vel.x,vel.z).toFixed(1)+' cm/s')+row('Heading',hd.toFixed(1)+'°')+row('Odometer',odom.toFixed(1)+' cm')+row('Contacts',grounded+' / 6 grounded')+row('Support',grounded>=3?'stable polygon':'unsupported');
+legs.forEach((L,i)=>dEls[i].classList.toggle('g',L.g))}
+
+function visuals(dt){
+robot.position.copy(body.position);robot.quaternion.copy(body.quaternion);
+for(const L of legs){
+ik(L);L.mat.color.setHex(L.g?0x10b981:0xf43f5e);L.mat.emissive.setHex(L.g?0x064e3b:0x881337);
+if(L.jaws.length){L.jaws[0].rotation.y=jaw;L.jaws[1].rotation.y=-jaw}}
+const tt=performance.now()/1000;for(const c of claws)c.fm.rotation.y=-c.s*(.1+.18*Math.max(0,Math.sin(tt*1.7+c.s*2)));
+const pos=polyGeo.attributes.position;let n=0,first=null;
+for(const L of legs)if(L.g){pos.setXYZ(n++,L.fw.x,.2,L.fw.z);if(!first)first=L.fw}
+if(first)pos.setXYZ(n++,first.x,.2,first.z);
+polyGeo.setDrawRange(0,n);pos.needsUpdate=true;poly.visible=n>=3;
+com.position.set(body.position.x,.4,body.position.z);
+ballMesh.visible=ballMode>0;ballMesh.position.copy(ballBody.position);
+pole.visible=ballMode===1||ballMode===2;pole.position.set(home.x,home.y/2,home.z);pole.scale.y=Math.max(home.y,.1);
+const tg=new T.Vector3(body.position.x,body.position.y*.5,body.position.z),nt=controls.target.clone().lerp(tg,1-Math.exp(-5*dt));
+camera.position.add(nt.clone().sub(controls.target));controls.target.copy(nt);
+sun.position.set(body.position.x+60,120,body.position.z+80);sun.target.position.set(body.position.x,0,body.position.z);
+floor.position.set(Math.round(body.position.x/100)*100,0,Math.round(body.position.z/100)*100);
+labels(body.position.x,body.position.z)}
+
+let last=performance.now(),acc=0;
+function frame(now){
+requestAnimationFrame(frame);
+const dt=Math.min((now-last)/1000,.05);last=now;
+if(!S.paused){acc+=dt;let n=0;while(acc>=DT&&n<16){substep();acc-=DT;n++}
+if(!isFinite(body.position.x+body.position.y+body.position.z)||Math.abs(body.position.y)>60)reset();odom+=Math.hypot(body.position.x-lastX,body.position.z-lastZ)}
+lastX=body.position.x;lastZ=body.position.z;
+visuals(dt);if(++fc%6===0)hud();
+controls.update();camStep(dt);renderer.render(scene,camera);pipRender()}
+
+const btns=[...document.querySelectorAll('[data-c]')],bm=document.getElementById('bm'),bpz=document.getElementById('bp');
+function sync(){btns.forEach(b=>b.classList.toggle('on',b.dataset.c===S.cmd&&S.mode==='walk'));bm.classList.toggle('on',S.mode==='manip');bpz.classList.toggle('on',S.paused);bpz.textContent=S.paused?'Resume':'Pause'}
+function cmd(c){S.cmd=c;if(c!=='stop')S.mode='walk';sync()}
+btns.forEach(b=>b.onclick=()=>cmd(b.dataset.c));
+bm.onclick=()=>{S.mode=S.mode==='manip'?'walk':'manip';sync()};
+bpz.onclick=()=>{S.paused=!S.paused;sync()};
+document.getElementById('br').onclick=reset;
+const bind=(id,lab,fn,fmt)=>{const r=document.getElementById(id);r.oninput=()=>{fn(parseFloat(r.value));document.getElementById(lab).textContent=fmt(parseFloat(r.value))}};
+bind('rs','ls',v=>P.speed=v,v=>v.toFixed(1)+'x');
+bind('rl','ll',v=>P.lift=v/10,v=>v+' mm');
+bind('rh','lh',v=>P.height=v/10,v=>v+' mm');
+const KEYS={w:'forward',arrowup:'forward',s:'backward',arrowdown:'backward',a:'crabL',arrowleft:'crabL',d:'crabR',arrowright:'crabR',q:'turnL',e:'turnR',' ':'stop'};
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();if(KEYS[k]){e.preventDefault();cmd(KEYS[k])}else if(k==='m'){bm.click()}else if(k==='p'){bpz.click()}});
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+
+const cam={pan:0,tilt:0,tp:0,tt:0,scan:false,view:true};
+const rP=document.getElementById('rp'),rT=document.getElementById('rt'),bcc=document.getElementById('bcc'),bcs=document.getElementById('bcs'),bcv=document.getElementById('bcv'),pip=document.getElementById('pip'),lp=document.getElementById('lp'),lt=document.getElementById('lt'),pipt=document.getElementById('pipt');
+const stopScan=()=>{cam.scan=false;bcs.classList.remove('on')};
+rP.oninput=()=>{cam.tp=+rP.value;stopScan()};
+rT.oninput=()=>{cam.tt=+rT.value};
+function camCenter(){cam.tp=cam.tt=0;rP.value=rT.value=0;stopScan()}
+bcc.onclick=camCenter;
+bcs.onclick=()=>{cam.scan=!cam.scan;bcs.classList.toggle('on',cam.scan)};
+bcv.onclick=()=>{cam.view=!cam.view;bcv.classList.toggle('on',cam.view)};
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();if(k==='z'||k==='x'){stopScan();cam.tp=clamp(cam.tp+(k==='z'?-10:10),-170,170);rP.value=cam.tp}else if(k==='c')camCenter()});
+function camStep(dt){
+if(cam.scan){cam.tp=130*Math.sin(performance.now()/1000*.7);rP.value=cam.tp}
+const r=200*dt;
+cam.pan+=clamp(cam.tp-cam.pan,-r,r);cam.tilt+=clamp(cam.tt-cam.tilt,-r,r);
+camPanG.rotation.y=-cam.pan*Math.PI/180;camTiltG.rotation.x=cam.tilt*Math.PI/180;
+lp.textContent=Math.round(cam.pan)+'°';lt.textContent=Math.round(cam.tilt)+'°';
+pipt.textContent='PAN '+Math.round(cam.pan)+'° TILT '+Math.round(cam.tilt)+'°'}
+function pipRender(){
+pip.style.display=cam.view?'block':'none';if(!cam.view)return;
+const r=pip.getBoundingClientRect(),y=innerHeight-r.bottom;
+rcam.aspect=r.width/r.height;rcam.updateProjectionMatrix();
+renderer.setScissorTest(true);renderer.setViewport(r.left,y,r.width,r.height);renderer.setScissor(r.left,y,r.width,r.height);
+renderer.render(scene,rcam);
+renderer.setScissorTest(false);renderer.setViewport(0,0,innerWidth,innerHeight)}
+reset();sync();requestAnimationFrame(frame);
+</script>
+</body>
+</html>
